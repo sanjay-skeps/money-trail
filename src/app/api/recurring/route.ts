@@ -9,10 +9,10 @@ export const runtime = "nodejs";
 const schema = z.object({ type: z.enum(["income", "expense"]), description: z.string().trim().min(1).max(160), category: z.string().trim().min(1).max(60).default("Other"), amount: z.coerce.number().positive(), cadence: z.enum(["weekly", "monthly", "yearly"]), nextDate: z.iso.date(), accountId: z.uuid().nullable().optional() });
 export async function GET() {
   const user = await getCurrentUserWithRefresh(); if (!user) return NextResponse.json({ error: "session" }, { status: 401 });
-  const schedules = await db.select().from(recurring).where(and(eq(recurring.userId, user.id), eq(recurring.active, true)));
+  const schedules = await db.select().from(recurring).where(eq(recurring.userId, user.id));
   const today = new Date().toISOString().slice(0, 10);
-  for (const schedule of schedules) if (schedule.nextDate <= today) await db.insert(recurringOccurrences).values({ recurringId: schedule.id, dueDate: schedule.nextDate }).onConflictDoNothing();
-  const due = await db.select({ occurrence: recurringOccurrences, schedule: recurring }).from(recurringOccurrences).innerJoin(recurring, eq(recurring.id, recurringOccurrences.recurringId)).where(and(eq(recurring.userId, user.id), eq(recurringOccurrences.status, "pending")));
+  for (const schedule of schedules) if (schedule.active && schedule.nextDate <= today) await db.insert(recurringOccurrences).values({ recurringId: schedule.id, dueDate: schedule.nextDate }).onConflictDoNothing();
+  const due = await db.select({ occurrence: recurringOccurrences, schedule: recurring }).from(recurringOccurrences).innerJoin(recurring, eq(recurring.id, recurringOccurrences.recurringId)).where(and(eq(recurring.userId, user.id), eq(recurring.active, true), eq(recurringOccurrences.status, "pending")));
   return NextResponse.json({ recurring: schedules, due });
 }
 export async function POST(request: NextRequest) {

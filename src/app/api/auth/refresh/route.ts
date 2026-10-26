@@ -13,7 +13,7 @@ export async function GET(request: NextRequest) {
   }
 
   const returnToValue = request.nextUrl.searchParams.get("returnTo");
-  const requestedPath = isSafeReturnTo(returnToValue) ? returnToValue : "/dashboard";
+  const requestedPath = returnToValue && isSafeReturnTo(returnToValue) ? returnToValue : "/dashboard";
   const target = new URL(requestedPath, request.url);
   const returnTo = target.origin === request.nextUrl.origin ? target : new URL("/dashboard", request.url);
   const jar = await cookies();

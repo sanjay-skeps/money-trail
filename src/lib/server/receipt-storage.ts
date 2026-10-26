@@ -6,7 +6,9 @@ const localRoot = join(process.cwd(), ".data", "receipts");
 function remoteUrl(key: string) { return `${process.env.RECEIPT_STORAGE_URL!.replace(/\/$/, "")}/${key.split("/").map(encodeURIComponent).join("/")}`; }
 export async function putReceipt(key: string, bytes: Uint8Array, contentType: string) {
   if (process.env.RECEIPT_STORAGE_URL) {
-    const response = await fetch(remoteUrl(key), { method: "PUT", headers: { Authorization: `Bearer ${process.env.RECEIPT_STORAGE_TOKEN ?? ""}`, "Content-Type": contentType }, body: bytes });
+    const body = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(body).set(bytes);
+    const response = await fetch(remoteUrl(key), { method: "PUT", headers: { Authorization: `Bearer ${process.env.RECEIPT_STORAGE_TOKEN ?? ""}`, "Content-Type": contentType }, body });
     if (!response.ok) throw new Error("Receipt storage rejected upload");
     return;
   }
