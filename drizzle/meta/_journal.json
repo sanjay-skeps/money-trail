@@ -29,6 +29,13 @@
       "when": 1790326000000,
       "tag": "0003_recurring_anchor_category_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790327000000,
+      "tag": "0004_category_rules",
+      "breakpoints": true
     }
   ]
 }

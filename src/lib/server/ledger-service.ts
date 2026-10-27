@@ -12,7 +12,7 @@ const splitSchema = z.array(z.object({ label: z.string().trim().min(1).max(100),
 export const transactionInput = z.object({
   type: z.enum(["expense", "income", "transfer"]).default("expense"),
   description: z.string().trim().min(1).max(160), merchant: z.string().trim().max(120).optional().nullable(),
-  category: z.string().trim().min(1).max(60).default("Other"), amount: z.coerce.number().positive().finite().max(999999999999),
+  category: z.string().trim().min(1).max(60).default("Other"), categoryId: z.uuid().optional().nullable(), amount: z.coerce.number().positive().finite().max(999999999999),
   transactionDate: z.iso.date(), notes: z.string().max(2000).optional().nullable(),
   paymentMethod: z.enum(["cash", "upi", "card", "bank", "wallet"]).default("cash"),
   accountId: z.uuid().optional().nullable(), toAccountId: z.uuid().optional().nullable(),
@@ -26,7 +26,7 @@ async function ownedAccount(userId: string, id?: string | null) {
   return account ?? null;
 }
 
-export async function listTransactions(userId: string, filters: { q?: string; type?: string; category?: string; from?: string; to?: string }) {
+export async function listTransactions(userId: string, filters: { q?: string; type?: string; category?: string; from?: string; to?: string; limit?: number; offset?: number }) {
   const clauses = [eq(transactions.userId, userId)];
   if (filters.type && ["expense", "income", "transfer"].includes(filters.type)) clauses.push(eq(transactions.type, filters.type));
   if (filters.category) clauses.push(eq(transactions.category, filters.category));
@@ -36,7 +36,7 @@ export async function listTransactions(userId: string, filters: { q?: string; ty
     const pattern = `%${filters.q.trim().replace(/^#/, "")}%`;
     clauses.push(or(ilike(transactions.description, pattern), ilike(transactions.merchant, pattern), ilike(transactions.notes, pattern), exists(db.select({ id: transactionTags.tagId }).from(transactionTags).innerJoin(tags, eq(tags.id, transactionTags.tagId)).where(and(eq(transactionTags.transactionId, transactions.id), eq(tags.userId, userId), ilike(tags.name, pattern)))))!);
   }
-  const rows = await db.select().from(transactions).where(and(...clauses)).orderBy(desc(transactions.transactionDate), desc(transactions.createdAt)).limit(300);
+  const rows = await db.select().from(transactions).where(and(...clauses)).orderBy(desc(transactions.transactionDate), desc(transactions.createdAt), desc(transactions.id)).limit(filters.limit ?? 300).offset(filters.offset ?? 0);
   const ids = rows.map((row) => row.id);
   if (!ids.length) return rows;
   const [splitRows, tagRows] = await Promise.all([
@@ -57,14 +57,22 @@ export async function saveTransaction(userId: string, input: TransactionInput, i
     if (existingSplits.length && !splitsMatchAmount(existingSplits, input.amount)) return { error: "split" as const };
   }
 
-  // Names are only unique per parent, so match the transaction's type and prefer a top-level category, then the oldest.
-  const [category] = await db.select({ id: categories.id }).from(categories)
-    .where(and(eq(categories.userId, userId), eq(categories.name, input.category), input.type === "transfer" ? undefined : eq(categories.type, input.type)))
-    .orderBy(sql`${categories.parentId} is not null`, categories.createdAt, categories.id).limit(1);
+  let category: { id: string; name: string } | undefined;
+  if (input.categoryId) {
+    // An explicit id is exact, and its stored name wins over any name sent alongside it.
+    [category] = await db.select({ id: categories.id, name: categories.name }).from(categories)
+      .where(and(eq(categories.id, input.categoryId), eq(categories.userId, userId), input.type === "transfer" ? undefined : eq(categories.type, input.type)));
+    if (!category) return { error: "category" as const };
+  } else {
+    // Callers that only know a name: names are only unique per parent, so match the type and prefer a top-level category, then the oldest.
+    [category] = await db.select({ id: categories.id, name: categories.name }).from(categories)
+      .where(and(eq(categories.userId, userId), eq(categories.name, input.category), input.type === "transfer" ? undefined : eq(categories.type, input.type)))
+      .orderBy(sql`${categories.parentId} is not null`, categories.createdAt, categories.id).limit(1);
+  }
   const saved = await db.transaction(async (tx) => {
     const values = {
       userId, type: input.type, description: input.description, merchant: input.merchant || null,
-      categoryId: category?.id ?? null, category: input.category, amount: input.amount.toFixed(2),
+      categoryId: category?.id ?? null, category: category?.name ?? input.category, amount: input.amount.toFixed(2),
       transactionDate: input.transactionDate, notes: input.notes || null, paymentMethod: input.paymentMethod,
       accountId: input.accountId || null, toAccountId: input.type === "transfer" ? input.toAccountId! : null,
       updatedAt: new Date(),

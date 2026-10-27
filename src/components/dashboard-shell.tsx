@@ -1,14 +1,17 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState, type ChangeEvent, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { ArrowDownLeft, ArrowUpRight, Bell, CalendarClock, ChartNoAxesCombined, CircleHelp, CircleUserRound, LayoutDashboard, LogOut, Menu, Plus, Settings2, Wallet, X } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, Bell, CalendarClock, ChartNoAxesCombined, CircleHelp, CircleUserRound, LayoutDashboard, LogOut, Menu, Plus, Settings2, Sparkles, Upload, Wallet, X } from "lucide-react";
 import { currencies, currencySymbol, formatMoney } from "@/lib/currency";
 import { SpendingChart } from "@/components/spending-chart";
+import { StatementImport } from "@/components/statement-import";
+import { CategoryRules } from "@/components/category-rules";
+import { TransactionAssistant } from "@/components/transaction-assistant";
 import type { SessionUser } from "@/lib/types";
 
-type Expense = { id: string; type: "expense" | "income" | "transfer"; description: string; category: string; amount: string; transactionDate: string; merchant?: string | null; notes?: string | null; paymentMethod: string; accountId?: string | null; toAccountId?: string | null; receiptIds?: string[]; tags?: string[]; splits?: { label: string; amount: string; isMine: boolean }[] };
+type Expense = { id: string; type: "expense" | "income" | "transfer"; description: string; category: string; categoryId?: string | null; amount: string; transactionDate: string; merchant?: string | null; notes?: string | null; paymentMethod: string; accountId?: string | null; toAccountId?: string | null; receiptIds?: string[]; tags?: string[]; splits?: { label: string; amount: string; isMine: boolean }[] };
 type Account = { id: string; name: string; type: string; kind: string; openingBalance: string; balance: number; archived: boolean };
 type RecurringSchedule = { id: string; type: "expense" | "income"; description: string; category: string; amount: string; cadence: "weekly" | "monthly" | "yearly"; nextDate: string; accountId: string | null; active: boolean };
 type DashboardData = {
@@ -27,9 +30,17 @@ type DashboardData = {
 };
 type AnalyticsSummary = { yearlyExpenses: number; averageDailyExpense: number; recurringMonthlyEstimate: number; merchants: { merchant: string; total: number; count: number }[]; categoryTrends: { category: string; month: string; amount: number }[] };
 const categoryIcons: Record<string, string> = { Food: "◒", Transport: "↗", Shopping: "◇", Bills: "▤", Health: "+", Entertainment: "✳", Other: "·" };
-const categories = ["Food", "Transport", "Shopping", "Bills", "Health", "Entertainment", "Other"];
-const incomeCategories = ["Salary", "Other income"];
+type CategoryOption = { id: string; label: string };
+const defaultCategoryName = { expense: "Food", income: "Salary", transfer: "" } as const;
+const transactionPageSize = 15;
 
+/** Categories usable for a transaction type, labelled "Parent › Child" so same-named subcategories stay distinct. */
+function categoryOptions(all: DashboardData["categories"], type: string): CategoryOption[] {
+  return all.filter((category) => type === "transfer" || category.type === type).map((category) => {
+    const parent = category.parentId ? all.find((item) => item.id === category.parentId) : null;
+    return { id: category.id, label: parent ? `${parent.name} › ${category.name}` : category.name };
+  });
+}
 async function responseBody(response: Response) {
   try { return await response.json(); } catch { return {}; }
 }
@@ -50,6 +61,8 @@ export function DashboardShell() {
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState(false);
   const [addModalOpen, setAddModalOpen] = useState(false);
+  const [importModalOpen, setImportModalOpen] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [exportFormat, setExportFormat] = useState<"json" | "csv">("json");
@@ -60,16 +73,20 @@ export function DashboardShell() {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [transactionRows, setTransactionRows] = useState<Expense[] | null>(null);
+  const [hasMoreTransactions, setHasMoreTransactions] = useState(false);
+  const [loadingMoreTransactions, setLoadingMoreTransactions] = useState(false);
+  const transactionQuery = useRef({ filters: "", request: 0, loaded: 0 });
+  const transactionSentinel = useRef<HTMLDivElement>(null);
   const [trendPeriod, setTrendPeriod] = useState("monthly");
   const [trendData, setTrendData] = useState<{ day: string; amount: number; income: number }[]>([]);
   const [dataRevision, setDataRevision] = useState(0);
   const [analytics, setAnalytics] = useState<AnalyticsSummary | null>(null);
   const [recurringItems, setRecurringItems] = useState<RecurringSchedule[]>([]);
   const [newTransactionType, setNewTransactionType] = useState<"expense" | "income" | "transfer">("expense");
-  const [newCategory, setNewCategory] = useState("Food");
+  const [newCategory, setNewCategory] = useState("");
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const profileModalOpen = exportModalOpen || deleteModalOpen;
-  const anyModalOpen = addModalOpen || profileModalOpen;
+  const anyModalOpen = addModalOpen || importModalOpen || assistantOpen || profileModalOpen;
 
   const loadDashboard = useCallback(async () => {
     setLoading(true);
@@ -98,6 +115,8 @@ export function DashboardShell() {
     function closeOnEscape(event: KeyboardEvent) {
       if (event.key === "Escape") {
         setAddModalOpen(false);
+        setImportModalOpen(false);
+        setAssistantOpen(false);
         setExportModalOpen(false);
         setDeleteModalOpen(false);
         setDeleteConfirmation("");
@@ -109,17 +128,56 @@ export function DashboardShell() {
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [anyModalOpen]);
+  const transactionFilters = new URLSearchParams(Object.entries({ q: search.trim(), type: filterType === "all" ? "" : filterType, from: dateFrom, to: dateTo }).filter(([, value]) => value)).toString();
+  const fetchTransactionPage = useCallback(async (offset: number, limit: number) => {
+    const response = await fetch(`/api/transactions?${transactionFilters}${transactionFilters ? "&" : ""}limit=${limit}&offset=${offset}`, { cache: "no-store" });
+    const result = await response.json();
+    if (!Array.isArray(result.transactions)) throw new Error("transactions");
+    return result as { transactions: Expense[]; hasMore: boolean };
+  }, [transactionFilters]);
   useEffect(() => {
     if (!data) return;
-    let active = true;
-    const params = new URLSearchParams();
-    if (search.trim()) params.set("q", search.trim());
-    if (filterType !== "all") params.set("type", filterType);
-    if (dateFrom) params.set("from", dateFrom);
-    if (dateTo) params.set("to", dateTo);
-    fetch(`/api/transactions?${params}`, { cache: "no-store" }).then((response) => response.json()).then((result) => { if (active && Array.isArray(result.transactions)) setTransactionRows(result.transactions); }).catch(() => { if (active) setTransactionRows(data.expenses); });
-    return () => { active = false; };
-  }, [data?.user.id, dataRevision, search, filterType, dateFrom, dateTo]);
+    const query = transactionQuery.current;
+    // New filters start over at one page; a refresh after an edit keeps the rows already scrolled into view.
+    const limit = query.filters === transactionFilters ? Math.min(100, Math.max(transactionPageSize, query.loaded)) : transactionPageSize;
+    query.filters = transactionFilters;
+    const request = ++query.request;
+    setLoadingMoreTransactions(false);
+    fetchTransactionPage(0, limit).then((result) => {
+      if (request !== query.request) return;
+      query.loaded = result.transactions.length;
+      setTransactionRows(result.transactions);
+      setHasMoreTransactions(result.hasMore);
+    }).catch(() => { if (request === query.request) { setTransactionRows(data.expenses); setHasMoreTransactions(false); } });
+  }, [data?.user.id, dataRevision, transactionFilters, fetchTransactionPage]);
+  const loadMoreTransactions = useCallback(async () => {
+    const query = transactionQuery.current;
+    if (loadingMoreTransactions || !hasMoreTransactions) return;
+    const request = query.request;
+    setLoadingMoreTransactions(true);
+    try {
+      const result = await fetchTransactionPage(query.loaded, transactionPageSize);
+      if (request !== query.request) return;
+      setTransactionRows((current) => {
+        const seen = new Set((current ?? []).map((row) => row.id));
+        const merged = [...(current ?? []), ...result.transactions.filter((row) => !seen.has(row.id))];
+        query.loaded = merged.length;
+        return merged;
+      });
+      setHasMoreTransactions(result.hasMore);
+    } catch {
+      if (request === query.request) setHasMoreTransactions(false);
+    } finally {
+      if (request === query.request) setLoadingMoreTransactions(false);
+    }
+  }, [fetchTransactionPage, hasMoreTransactions, loadingMoreTransactions]);
+  useEffect(() => {
+    const sentinel = transactionSentinel.current;
+    if (!sentinel || !hasMoreTransactions) return;
+    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) void loadMoreTransactions(); }, { rootMargin: "200px" });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMoreTransactions, loadMoreTransactions, transactionRows]);
   useEffect(() => {
     if (!data) return;
     let active = true;
@@ -146,7 +204,7 @@ export function DashboardShell() {
     }
     if (!response.ok) {
       setNoticeError(true);
-      setNotice(result.error === "expense" ? "Check the expense details and try again." : result.error === "split" ? "Split shares must add up to the transaction amount." : result.error === "exists" ? "A category with that name already exists." : "That change could not be saved. Please try again.");
+      setNotice(result.error === "expense" ? "Check the expense details and try again." : result.error === "split" ? "Split shares must add up to the transaction amount." : result.error === "exists" ? "A category with that name already exists." : result.error === "category" ? "Choose a category that matches the transaction type." : "That change could not be saved. Please try again.");
       return false;
     }
     setNoticeError(false);
@@ -165,12 +223,12 @@ export function DashboardShell() {
       const response = await fetch("/api/transactions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...values, transactionDate: values.spentOn, spentOn: undefined, accountId: values.accountId || null, toAccountId: values.toAccountId || null, tags: String(values.tags ?? "").split(",").map((tag) => tag.trim()).filter(Boolean), splits: parseSplits(values.splitDetails) }),
+        body: JSON.stringify({ ...values, transactionDate: values.spentOn, spentOn: undefined, categoryId: values.categoryId || null, accountId: values.accountId || null, toAccountId: values.toAccountId || null, tags: String(values.tags ?? "").split(",").map((tag) => tag.trim()).filter(Boolean), splits: parseSplits(values.splitDetails) }),
       });
       if (await handleMutation(response, "Transaction saved.")) {
         form.reset();
         setNewTransactionType("expense");
-        setNewCategory("Food");
+        setNewCategory("");
         setAddModalOpen(false);
       }
     } catch {
@@ -184,7 +242,7 @@ export function DashboardShell() {
     const form = event.currentTarget;
     setPending(true);
     const raw = Object.fromEntries([...new FormData(form).entries()].filter(([key]) => key !== "id"));
-    const values = { ...raw, transactionDate: raw.spentOn, spentOn: undefined, accountId: raw.accountId || null, toAccountId: raw.toAccountId || null, tags: String(raw.tags ?? "").split(",").map((tag) => tag.trim()).filter(Boolean), splits: parseSplits(raw.splitDetails) ?? [] };
+    const values = { ...raw, transactionDate: raw.spentOn, spentOn: undefined, categoryId: raw.categoryId || null, accountId: raw.accountId || null, toAccountId: raw.toAccountId || null, tags: String(raw.tags ?? "").split(",").map((tag) => tag.trim()).filter(Boolean), splits: parseSplits(raw.splitDetails) ?? [] };
     try {
       await handleMutation(await fetch(`/api/transactions/${encodeURIComponent(expenseId)}`, {
         method: "PATCH",
@@ -399,12 +457,18 @@ export function DashboardShell() {
   const change = previousTotal > 0 ? Math.round(((monthlyTotal - previousTotal) / previousTotal) * 100) : 0;
   const searchText = search.toLowerCase().replace(/^#/, "");
   const shownExpenses = transactionRows ?? expenses.filter((item) => (filterType === "all" || item.type === filterType) && (!dateFrom || item.transactionDate >= dateFrom) && (!dateTo || item.transactionDate <= dateTo) && `${item.description} ${item.category} ${item.merchant ?? ""} ${item.notes ?? ""} ${(item.tags ?? []).join(" ")}`.toLowerCase().includes(searchText));
-  const newCategoryOptions = [...new Set([...(newTransactionType === "income" ? incomeCategories : categories), ...data.categories.filter((category) => newTransactionType === "transfer" || category.type === newTransactionType).map((category) => category.name)])];
+  const newCategoryOptions = categoryOptions(data.categories, newTransactionType);
+  // Until the user picks one, default to Food/Salary (or the first category) for the chosen type.
+  const selectedNewCategory = newCategoryOptions.some((option) => option.id === newCategory) ? newCategory : (newCategoryOptions.find((option) => option.label === defaultCategoryName[newTransactionType]) ?? newCategoryOptions[0])?.id ?? "";
 
-  return <main className={`dashboard-app view-${view}${addModalOpen && view === "overview" ? " add-modal-open" : ""}${profileModalOpen && view === "profile" ? " profile-modal-open" : ""}`}>
+  // Overview and Transactions open the add form as a dialog instead of showing it inline.
+  const addAsModal = view === "overview" || view === "transactions";
+  return <main className={`dashboard-app view-${view}${addModalOpen && addAsModal ? " add-modal-open" : ""}${profileModalOpen && view === "profile" ? " profile-modal-open" : ""}`}>
     <aside className={`sidebar${mobileMenuOpen ? " sidebar-open" : ""}`}><Link href="/dashboard" className="brand" onClick={() => setMobileMenuOpen(false)}><span className="brand-mark">m</span> money trail</Link><div className="sidebar-label">YOUR SPACE</div><nav className="sidebar-nav" aria-label="Dashboard navigation">{navigation.map(({ href, label, icon: Icon, key }) => <Link key={key} className={`side-link${view === key ? " active" : ""}`} href={href} aria-current={view === key ? "page" : undefined} onClick={() => setMobileMenuOpen(false)}><Icon size={17} /> {label}</Link>)}</nav><div className="sidebar-bottom"><div className="sidebar-user"><Link href="/dashboard/profile" className="sidebar-profile-link" title="Open profile" aria-label={`Open profile for ${user.name}, ${user.email}`} onClick={() => setMobileMenuOpen(false)}><div className="user-avatar"><CircleUserRound size={17} /></div><div className="user-meta"><b>{user.name}</b><small>{user.email}</small></div></Link><button className="icon-button" title="Log out" aria-label="Log out" onClick={() => void logout()} disabled={pending}><LogOut size={17} /></button></div><span className="sidebar-footnote"><CircleHelp size={14} /> A little more clarity, every day.</span></div></aside>
-    {addModalOpen && view === "overview" && <button type="button" className="modal-backdrop" aria-label="Close add transaction dialog" onClick={() => setAddModalOpen(false)} />}
-    <section className="dashboard-main"><header className="dash-header"><button className="mobile-menu-toggle" aria-label={mobileMenuOpen ? "Close navigation" : "Open navigation"} aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen((open) => !open)}>{mobileMenuOpen ? <X size={19} /> : <Menu size={19} />}</button><div className="mobile-brand"><span className="brand-mark">m</span> money trail</div><div><span className="dash-date">YOUR MONEY, IN GOOD VIEW</span><h1>{view === "overview" ? `Good day, ${user.name.split(" ")[0]}` : pageTitle} <span>✳</span></h1>{view === "profile" && <p className="profile-header-copy">Manage your personal details, security, and account data.</p>}</div>{view === "overview" && <button type="button" className="button button-dark add-top" onClick={() => setAddModalOpen(true)}><Plus size={16} /> Add transaction</button>}{view === "transactions" && <a href="#add-expense" className="button button-dark add-top"><Plus size={16} /> Add transaction</a>}</header>
+    {addModalOpen && addAsModal && <button type="button" className="modal-backdrop" aria-label="Close add transaction dialog" onClick={() => setAddModalOpen(false)} />}
+    {importModalOpen && view === "transactions" && <button type="button" className="modal-backdrop" aria-label="Close import dialog" onClick={() => setImportModalOpen(false)} />}
+    {assistantOpen && addAsModal && <button type="button" className="modal-backdrop" aria-label="Close assistant" onClick={() => setAssistantOpen(false)} />}
+    <section className="dashboard-main"><header className="dash-header"><button className="mobile-menu-toggle" aria-label={mobileMenuOpen ? "Close navigation" : "Open navigation"} aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen((open) => !open)}>{mobileMenuOpen ? <X size={19} /> : <Menu size={19} />}</button><div className="mobile-brand"><span className="brand-mark">m</span> money trail</div><div><span className="dash-date">YOUR MONEY, IN GOOD VIEW</span><h1>{view === "overview" ? `Good day, ${user.name.split(" ")[0]}` : pageTitle} <span>✳</span></h1>{view === "profile" && <p className="profile-header-copy">Manage your personal details, security, and account data.</p>}</div>{view === "overview" && <div className="header-actions"><button type="button" className="button button-light add-top" onClick={() => setAssistantOpen(true)}><Sparkles size={16} /> Add with AI</button><button type="button" className="button button-dark add-top" onClick={() => setAddModalOpen(true)}><Plus size={16} /> Add transaction</button></div>}{view === "transactions" && <div className="header-actions"><button type="button" className="button button-light add-top" onClick={() => setImportModalOpen(true)}><Upload size={16} /> Import statement</button><button type="button" className="button button-light add-top" onClick={() => setAssistantOpen(true)}><Sparkles size={16} /> Add with AI</button><button type="button" className="button button-dark add-top" onClick={() => setAddModalOpen(true)}><Plus size={16} /> Add transaction</button></div>}</header>
       {notice && <p className={noticeError ? "notice notice-error" : "notice"} role="status">{notice}</p>}
       {view === "overview" && <><div className="summary-grid"><article className="summary-card main-summary"><div className="summary-label"><span>NET WORTH</span><span className="summary-icon"><Wallet size={16} /></span></div><div className="summary-amount">{formatMoney(data.netWorth, user.currency)}</div><div className="summary-note">Across {data.accounts.length} tracked accounts</div><div className="summary-decoration">✳</div></article>
         <article className="summary-card"><div className="summary-label"><span>INCOME THIS MONTH</span><span className="summary-icon muted"><ArrowDownLeft size={16} /></span></div><div className="summary-amount small-amount">{formatMoney(data.incomeTotal, user.currency)}</div><div className="summary-note">Savings rate {data.savingsRate}%</div></article>
@@ -440,6 +504,7 @@ export function DashboardShell() {
             </div>) : <p className="muted-copy">No custom categories yet.</p>}
           </div>
         </section>
+        <CategoryRules categories={data.categories} />
       </div>}
       {view === "profile" && <div className="profile-page">
         <section className="panel profile-card">
@@ -490,11 +555,11 @@ export function DashboardShell() {
           <div className="profile-modal-actions"><button type="button" className="button button-light button-small" onClick={closeProfileModal}>Cancel</button><button type="button" className="button button-danger button-small" disabled={pending || deleteConfirmation !== "DELETE"} onClick={() => void deleteProfile()}>Delete permanently</button></div>
         </div>}
       </div>}
-      <div className="lower-columns"><section className="panel transactions-panel" id="transactions"><div className="panel-heading"><div><span className="panel-kicker">YOUR RECENT TRAIL</span><h2>Transactions</h2></div>{view === "overview" ? <Link className="transaction-count" href="/dashboard/transactions">View all →</Link> : <span className="transaction-count">{shownExpenses.length} shown</span>}</div><div className="transaction-filters"><input aria-label="Search transactions" placeholder="Search description, merchant, notes" value={search} onChange={(event) => setSearch(event.target.value)} /><input aria-label="Start date" type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /><input aria-label="End date" type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /><select aria-label="Filter transaction type" value={filterType} onChange={(event) => setFilterType(event.target.value)}><option value="all">All types</option><option value="expense">Expenses</option><option value="income">Income</option><option value="transfer">Transfers</option></select></div>{shownExpenses.length ? <div className="expense-table">{shownExpenses.map((expense) => <details className="expense-row" key={expense.id}><summary><div className="expense-category-icon">{categoryIcons[expense.category] ?? "·"}</div><div className="expense-title"><b>{expense.description}</b><small>{expense.type} · {expense.category} · {new Date(`${expense.transactionDate}T12:00:00`).toLocaleDateString("en", { month: "short", day: "numeric" })}</small></div><b className="expense-amount">{expense.type === "income" ? "+" : expense.type === "expense" ? "−" : "↔"}{formatMoney(expense.amount, user.currency)}</b><span className="row-chevron">⌄</span></summary><div className="expense-edit"><form onSubmit={(event) => void editExpense(event, expense.id)} className="edit-expense-form"><input type="hidden" name="accountId" value={expense.accountId ?? ""} /><label>Description<input name="description" defaultValue={expense.description} maxLength={160} required /></label><label>Amount<input name="amount" type="number" min="0.01" step="0.01" defaultValue={expense.amount} required /></label><label>Type<select name="type" defaultValue={expense.type}><option value="expense">Expense</option><option value="income">Income</option><option value="transfer">Transfer</option></select></label><label>Category<select name="category" defaultValue={expense.category} required>{[...new Set([expense.category, ...(expense.type === "income" ? incomeCategories : categories), ...data.categories.filter((item) => expense.type === "transfer" || item.type === expense.type).map((item) => item.name)])].map((name) => <option key={name} value={name}>{name}</option>)}</select></label><label>Date<input name="spentOn" type="date" defaultValue={expense.transactionDate} required /></label><label>Transfer to<select name="toAccountId" defaultValue={expense.toAccountId ?? ""}><option value="">Select account</option>{data.accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label><label>Tags<input name="tags" defaultValue={expense.tags?.map((tag) => `#${tag}`).join(", ") ?? ""} placeholder="#work, #travel" /></label><label>Split shares<input name="splitDetails" defaultValue={expense.splits?.map((part) => `${part.isMine ? "Me" : part.label}:${part.amount}`).join(", ") ?? ""} placeholder="Me:500, Alex:300" /></label><label>Merchant<input name="merchant" defaultValue={expense.merchant ?? ""} maxLength={120} /></label><label>Notes<input name="notes" defaultValue={expense.notes ?? ""} maxLength={2000} /></label><label>Payment method<select name="paymentMethod" defaultValue={expense.paymentMethod}><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="bank">Bank</option><option value="wallet">Wallet</option></select></label><div className="edit-actions"><button className="button button-dark button-small" disabled={pending}>Save changes</button></div></form><ReceiptUpload transactionId={expense.id} onUploaded={() => void loadDashboard()} />{expense.receiptIds?.map((receiptId) => <a className="receipt-link" key={receiptId} href={`/api/receipts/${receiptId}`} target="_blank" rel="noreferrer">View attached receipt</a>)}<button className="text-danger" onClick={() => void deleteExpense(expense.id)} disabled={pending}>Delete transaction</button></div></details>)}</div> : <div className="empty-transactions"><span>☼</span><b>No transactions found</b><small>Try a different search or add your first transaction.</small></div>}</section>
-        <section className="panel add-panel" id="add-expense" role={view === "overview" ? "dialog" : undefined} aria-modal={view === "overview" && addModalOpen ? true : undefined} aria-labelledby="add-transaction-title">
-          <div className="panel-heading"><div><span className="panel-kicker">KEEP YOUR TRAIL</span><h2 id="add-transaction-title">Add transaction</h2></div>{view === "overview" && <button type="button" className="icon-button modal-close" aria-label="Close dialog" onClick={() => setAddModalOpen(false)}><X size={17} /></button>}<span className="add-circle"><Plus size={17} /></span></div>
+      <div className="lower-columns"><section className="panel transactions-panel" id="transactions"><div className="panel-heading"><div><span className="panel-kicker">YOUR RECENT TRAIL</span><h2>Transactions</h2></div>{view === "overview" ? <Link className="transaction-count" href="/dashboard/transactions">View all →</Link> : <span className="transaction-count">{shownExpenses.length} shown</span>}</div><div className="transaction-filters"><input aria-label="Search transactions" placeholder="Search description, merchant, notes" value={search} onChange={(event) => setSearch(event.target.value)} /><input aria-label="Start date" type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /><input aria-label="End date" type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /><select aria-label="Filter transaction type" value={filterType} onChange={(event) => setFilterType(event.target.value)}><option value="all">All types</option><option value="expense">Expenses</option><option value="income">Income</option><option value="transfer">Transfers</option></select><a className="button button-light button-small transaction-export" href={`/api/transactions/export?${transactionFilters}`}>Export CSV</a></div>{shownExpenses.length ? <div className="expense-table">{shownExpenses.map((expense) => <details className="expense-row" key={expense.id}><summary><div className="expense-category-icon">{categoryIcons[expense.category] ?? "·"}</div><div className="expense-title"><b>{expense.description}</b><small>{expense.type} · {expense.category} · {new Date(`${expense.transactionDate}T12:00:00`).toLocaleDateString("en", { month: "short", day: "numeric" })}</small></div><b className="expense-amount">{expense.type === "income" ? "+" : expense.type === "expense" ? "−" : "↔"}{formatMoney(expense.amount, user.currency)}</b><span className="row-chevron">⌄</span></summary><div className="expense-edit"><form onSubmit={(event) => void editExpense(event, expense.id)} className="edit-expense-form"><input type="hidden" name="accountId" value={expense.accountId ?? ""} /><label>Description<input name="description" defaultValue={expense.description} maxLength={160} required /></label><label>Amount<input name="amount" type="number" min="0.01" step="0.01" defaultValue={expense.amount} required /></label><label>Type<select name="type" defaultValue={expense.type}><option value="expense">Expense</option><option value="income">Income</option><option value="transfer">Transfer</option></select></label><label>Category<input type="hidden" name="category" value={expense.category} /><select name="categoryId" defaultValue={expense.categoryId ?? ""}>{!expense.categoryId && <option value="">{expense.category}</option>}{(expense.type === "income" ? ["income", "expense"] : ["expense", "income"]).map((type) => <optgroup key={type} label={type === "income" ? "Income" : "Expense"}>{categoryOptions(data.categories, type).map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</optgroup>)}</select></label><label>Date<input name="spentOn" type="date" defaultValue={expense.transactionDate} required /></label><label>Transfer to<select name="toAccountId" defaultValue={expense.toAccountId ?? ""}><option value="">Select account</option>{data.accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label><label>Tags<input name="tags" defaultValue={expense.tags?.map((tag) => `#${tag}`).join(", ") ?? ""} placeholder="#work, #travel" /></label><label>Split shares<input name="splitDetails" defaultValue={expense.splits?.map((part) => `${part.isMine ? "Me" : part.label}:${part.amount}`).join(", ") ?? ""} placeholder="Me:500, Alex:300" /></label><label>Merchant<input name="merchant" defaultValue={expense.merchant ?? ""} maxLength={120} /></label><label>Notes<input name="notes" defaultValue={expense.notes ?? ""} maxLength={2000} /></label><label>Payment method<select name="paymentMethod" defaultValue={expense.paymentMethod}><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="bank">Bank</option><option value="wallet">Wallet</option></select></label><div className="edit-actions"><button className="button button-dark button-small" disabled={pending}>Save changes</button></div></form><ReceiptUpload transactionId={expense.id} onUploaded={() => void loadDashboard()} />{expense.receiptIds?.map((receiptId) => <a className="receipt-link" key={receiptId} href={`/api/receipts/${receiptId}`} target="_blank" rel="noreferrer">View attached receipt</a>)}<button className="text-danger" onClick={() => void deleteExpense(expense.id)} disabled={pending}>Delete transaction</button></div></details>)}{view === "transactions" && hasMoreTransactions && <div ref={transactionSentinel} className="transactions-more"><button type="button" className="button button-light button-small" disabled={loadingMoreTransactions} onClick={() => void loadMoreTransactions()}>{loadingMoreTransactions ? "Loading…" : "Load more"}</button></div>}</div> : <div className="empty-transactions"><span>☼</span><b>No transactions found</b><small>Try a different search or add your first transaction.</small></div>}</section>
+        <section className="panel add-panel" id="add-expense" role={addAsModal ? "dialog" : undefined} aria-modal={addAsModal && addModalOpen ? true : undefined} aria-labelledby="add-transaction-title">
+          <div className="panel-heading"><div><span className="panel-kicker">KEEP YOUR TRAIL</span><h2 id="add-transaction-title">Add transaction</h2></div>{addAsModal && <button type="button" className="icon-button modal-close" aria-label="Close dialog" onClick={() => setAddModalOpen(false)}><X size={17} /></button>}<span className="add-circle"><Plus size={17} /></span></div>
           <form onSubmit={addExpense} className="expense-form">
-            <label>Type<select name="type" value={newTransactionType} onChange={(event) => { const nextType = event.target.value as "expense" | "income" | "transfer"; setNewTransactionType(nextType); setNewCategory(nextType === "income" ? "Salary" : "Food"); }}>
+            <label>Type<select name="type" value={newTransactionType} onChange={(event) => { const nextType = event.target.value as "expense" | "income" | "transfer"; setNewTransactionType(nextType); setNewCategory(""); }}>
               <option value="expense">Expense</option><option value="income">Income</option><option value="transfer">Transfer</option>
             </select></label>
             <label>{newTransactionType === "income" ? "Income description" : newTransactionType === "transfer" ? "Transfer description" : "What was it for?"}<input name="description" placeholder={newTransactionType === "income" ? "e.g. Salary, freelance work, or refund" : newTransactionType === "transfer" ? "e.g. Move to savings" : "e.g. Lunch with friends"} maxLength={160} required /></label>
@@ -502,7 +567,7 @@ export function DashboardShell() {
               <label>{newTransactionType === "income" ? "Amount received" : newTransactionType === "transfer" ? "Transfer amount" : "Amount"}<div className="amount-input"><span>{currencySymbol(user.currency)}</span><input name="amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></div></label>
               <label>Date<input name="spentOn" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required /></label>
             </div>
-            {newTransactionType !== "transfer" && <label>Category<select name="category" value={newCategory} onChange={(event) => setNewCategory(event.target.value)} required>{newCategoryOptions.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>}
+            {newTransactionType !== "transfer" && <label>Category<select name="categoryId" value={selectedNewCategory} onChange={(event) => setNewCategory(event.target.value)} required>{newCategoryOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label>}
             <label>{newTransactionType === "expense" ? "Paid from" : newTransactionType === "income" ? "Deposit to" : "From account"}<select name="accountId" required={newTransactionType === "transfer"} defaultValue={data.accounts.find((account) => account.kind === "asset")?.id ?? ""}><option value="">No account</option>{data.accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label>
             {newTransactionType === "transfer" && <label>To account<select name="toAccountId" required defaultValue=""><option value="">Select destination account</option>{data.accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label>}
             {newTransactionType !== "transfer" && <label>{newTransactionType === "income" ? "Received via" : "Payment method"}<select name="paymentMethod"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="bank">Bank</option><option value="wallet">Wallet</option></select></label>}
@@ -514,6 +579,8 @@ export function DashboardShell() {
             <button className="button button-dark button-full" disabled={pending}>Save {newTransactionType} <ArrowUpRight size={15} /></button>
           </form>
         </section></div>
+      {addAsModal && <div className="assistant-modal" role="dialog" aria-modal="true" aria-label="Add with AI" hidden={!assistantOpen}><TransactionAssistant currency={user.currency} onClose={() => setAssistantOpen(false)} onChange={() => { setDataRevision((value) => value + 1); void loadDashboard(); }} /></div>}
+      {view === "transactions" && <div className="import-modal" role="dialog" aria-modal="true" aria-label="Import statement" hidden={!importModalOpen}><StatementImport accounts={data.accounts} categories={data.categories} currency={user.currency} onClose={() => setImportModalOpen(false)} onImported={(count) => { setImportModalOpen(false); setNoticeError(false); setNotice(`Imported ${count} transaction${count === 1 ? "" : "s"}.`); setDataRevision((value) => value + 1); void loadDashboard(); }} /></div>}
       <div className="lower-columns finance-tools core-tools"><section className="panel"><div className="panel-heading"><div><span className="panel-kicker">YOUR MONEY</span><h2>Accounts</h2></div></div><div className="finance-list">{data.accounts.map((account) => <div className="managed-finance-row" key={account.id}><span>{account.name}<small>{account.type.replace("_", " ")}{account.archived ? " · archived" : ""}</small></span><div><b>{account.kind === "liability" ? "−" : ""}{formatMoney(account.balance, user.currency)}</b><details className="manage-details"><summary>Manage</summary><form className="manage-form" onSubmit={(event) => void updateResource(event, `/api/accounts/${account.id}`, "Account updated.")}><label>Name<input name="name" defaultValue={account.name} maxLength={100} required /></label><label>Opening balance<input name="openingBalance" type="number" step="0.01" min="0" defaultValue={account.openingBalance ?? account.balance} required /></label><button className="button button-dark button-small" disabled={pending}>Save</button><button type="button" className="button button-light button-small" disabled={pending} onClick={() => void patchResource(`/api/accounts/${account.id}`, { archived: !account.archived }, account.archived ? "Account restored." : "Account archived.")}>{account.archived ? "Restore" : "Archive"}</button></form></details></div></div>)}</div><form className="compact-form" onSubmit={(event) => void submitJson(event, "/api/accounts", "Account added.")}><input name="name" placeholder="Account name" required maxLength={100} /><select name="type"><option value="cash">Cash</option><option value="bank">Bank</option><option value="wallet">Wallet</option><option value="investment">Investment</option><option value="credit_card">Credit card</option></select><select name="kind"><option value="asset">Asset</option><option value="liability">Liability</option></select><input name="openingBalance" type="number" step="0.01" min="0" placeholder="Opening balance" required /><button className="button button-dark button-small" disabled={pending}>Add account</button></form></section>
         <section className="panel"><div className="panel-heading"><div><span className="panel-kicker">PLAN AHEAD</span><h2>Budgets</h2></div></div>{data.budgets.length ? <div className="finance-list">{data.budgets.map((budget) => <div className="budget-row managed-budget-row" key={budget.id}><span>{budget.name}<small>{budget.utilization}% used · {formatMoney(budget.remaining, user.currency)} left</small><i><em style={{ width: `${Math.min(100, budget.utilization)}%` }} /></i></span><div><b>{formatMoney(budget.amount, user.currency)}</b><details className="manage-details"><summary>Manage</summary><form className="manage-form" onSubmit={(event) => void updateResource(event, `/api/budgets/${budget.id}`, "Budget updated.")}><label>Name<input name="name" defaultValue={budget.name} maxLength={100} required /></label><label>Amount<input name="amount" type="number" step="0.01" min="0.01" defaultValue={budget.amount} required /></label><label>Category<select name="categoryId" defaultValue={budget.categoryId ?? ""}><option value="">All categories</option>{data.categories.filter((category) => category.type === "expense").map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label><label>Period<select name="period" defaultValue={budget.period}><option value="monthly">Monthly</option><option value="weekly">Weekly</option><option value="custom">Custom</option></select></label><label>Start date<input name="startDate" type="date" defaultValue={budget.startDate} required /></label><label>End date<input name="endDate" type="date" defaultValue={budget.endDate ?? ""} /></label><label>Alert threshold (%)<input name="alertAt" type="number" min="1" max="100" defaultValue={budget.alertAt} required /></label><label className="check-label"><input type="hidden" name="rollover" value="false" /><input name="rollover" type="checkbox" value="true" defaultChecked={budget.rollover} /> Rollover unused budget</label><button className="button button-dark button-small" disabled={pending}>Save budget</button><button type="button" className="text-danger" disabled={pending} onClick={() => void archiveResource(`/api/budgets/${budget.id}`, "Budget deactivated.", `Deactivate ${budget.name}?`)}>Deactivate</button></form></details></div></div>)}</div> : <p className="muted-copy">Create a budget to see spending progress here.</p>}<form className="compact-form" onSubmit={(event) => void submitJson(event, "/api/budgets", "Budget created.")}><input name="name" placeholder="Budget name" required maxLength={100} /><input name="amount" type="number" step="0.01" min="0.01" placeholder="Amount" required /><select name="categoryId" defaultValue=""><option value="">All categories</option>{data.categories.filter((category) => category.type === "expense").map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select><select name="period"><option value="monthly">Monthly</option><option value="weekly">Weekly</option><option value="custom">Custom</option></select><input name="startDate" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required /><input name="endDate" type="date" aria-label="Custom budget end date (optional)" /><input name="alertAt" type="number" min="1" max="100" defaultValue="80" aria-label="Alert at percent" /><label className="check-label"><input name="rollover" type="checkbox" value="true" /> Rollover</label><button className="button button-dark button-small" disabled={pending}>Add budget</button></form></section>
         <section className="panel"><div className="panel-heading"><div><span className="panel-kicker">STAY AHEAD</span><h2>Alerts</h2></div></div>{data.alerts.length ? <div className="finance-list">{data.alerts.map((alert) => <div key={alert.id}><span>{alert.message}<small>{alert.kind}{alert.readAt ? " · read" : " · new"}</small></span>{!alert.readAt && <button className="text-danger" onClick={() => void markAlertRead(alert.id)}>Mark read</button>}</div>)}</div> : <p className="muted-copy">Budget and bill alerts will appear here.</p>}</section></div>

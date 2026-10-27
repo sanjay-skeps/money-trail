@@ -3,11 +3,13 @@ import { compare, hash } from "bcryptjs";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
-  accounts, alerts, budgets, categories, expenses, receipts, recurring,
+  accounts, alerts, budgets, categories, categoryRules, expenses, receipts, recurring,
   recurringOccurrences, refreshSessions, tags, transactionSplits,
   transactionTags, transactions, users,
 } from "@/lib/db/schema";
 import { deleteReceipt } from "@/lib/server/receipt-storage";
+import { listTransactions } from "@/lib/server/ledger-service";
+import { toCsv } from "@/lib/csv";
 
 export async function updateProfileName(userId: string, name: string) {
   const [user] = await db.update(users)
@@ -37,7 +39,7 @@ export async function deleteProfileAccount(userId: string) {
 }
 
 export async function getUserDataExport(userId: string) {
-  const [userRows, accountRows, categoryRows, transactionRows, tagRows, receiptRows, budgetRows, recurringRows, alertRows, legacyExpenseRows] = await Promise.all([
+  const [userRows, accountRows, categoryRows, transactionRows, tagRows, receiptRows, budgetRows, recurringRows, alertRows, legacyExpenseRows, ruleRows] = await Promise.all([
     db.select({ name: users.name, email: users.email, currency: users.currency, createdAt: users.createdAt }).from(users).where(eq(users.id, userId)),
     db.select().from(accounts).where(eq(accounts.userId, userId)),
     db.select().from(categories).where(eq(categories.userId, userId)),
@@ -48,6 +50,7 @@ export async function getUserDataExport(userId: string) {
     db.select().from(recurring).where(eq(recurring.userId, userId)),
     db.select().from(alerts).where(eq(alerts.userId, userId)),
     db.select().from(expenses).where(eq(expenses.userId, userId)),
+    db.select().from(categoryRules).where(eq(categoryRules.userId, userId)),
   ]);
   const transactionIds = transactionRows.map((transaction) => transaction.id);
   const recurringIds = recurringRows.map((schedule) => schedule.id);
@@ -62,6 +65,7 @@ export async function getUserDataExport(userId: string) {
     profile: userRows[0] ?? null,
     accounts: accountRows,
     categories: categoryRows,
+    categoryRules: ruleRows,
     transactions: transactionRows,
     transactionSplits: splitRows,
     transactionTags: transactionTagRows,
@@ -75,39 +79,47 @@ export async function getUserDataExport(userId: string) {
   };
 }
 
-export async function getCsvTransactionExport(userId: string) {
-  const data = await getUserDataExport(userId);
-  const tagNameById = new Map(data.tags.map((tag) => [tag.id, tag.name] as const));
-  const tagsByTransaction = new Map<string, string[]>();
-  for (const relation of data.transactionTags) {
-    const tagName = tagNameById.get(relation.tagId);
-    if (tagName) tagsByTransaction.set(relation.transactionId, [...(tagsByTransaction.get(relation.transactionId) ?? []), tagName]);
-  }
-  const splitsByTransaction = new Map<string, string[]>();
-  for (const split of data.transactionSplits) {
-    splitsByTransaction.set(split.transactionId, [...(splitsByTransaction.get(split.transactionId) ?? []), `${split.label}: ${split.amount}${split.isMine ? " (mine)" : ""}`]);
-  }
-  const rows = [
+type CsvTransaction = typeof transactions.$inferSelect & { tags: string[]; splits: { label: string; amount: string; isMine: boolean }[] };
+
+function transactionsCsv(rows: CsvTransaction[], accountRows: { id: string; name: string }[], currency: string) {
+  const accountName = (id: string | null) => accountRows.find((account) => account.id === id)?.name ?? "";
+  return toCsv([
     ["Date", "Type", "Description", "Category", "Amount", "Currency", "Account", "Destination account", "Payment method", "Merchant", "Notes", "Tags", "Splits"],
-    ...data.transactions.map((transaction) => [
+    ...rows.map((transaction) => [
       transaction.transactionDate,
       transaction.type,
       transaction.description,
       transaction.category,
       transaction.amount,
-      data.profile?.currency ?? "INR",
-      data.accounts.find((account) => account.id === transaction.accountId)?.name ?? "",
-      data.accounts.find((account) => account.id === transaction.toAccountId)?.name ?? "",
+      currency,
+      accountName(transaction.accountId),
+      accountName(transaction.toAccountId),
       transaction.paymentMethod,
       transaction.merchant ?? "",
       transaction.notes ?? "",
-      (tagsByTransaction.get(transaction.id) ?? []).join(", "),
-      (splitsByTransaction.get(transaction.id) ?? []).join(", "),
+      transaction.tags.join(", "),
+      transaction.splits.map((split) => `${split.label}: ${split.amount}${split.isMine ? " (mine)" : ""}`).join(", "),
     ]),
-  ];
-  const escapeCell = (value: string) => {
-    const safe = /^[\s]*[=+\-@]/.test(value) ? `'${value}` : value;
-    return `"${safe.replace(/"/g, '""')}"`;
-  };
-  return rows.map((row) => row.map((value) => escapeCell(String(value))).join(",")).join("\r\n");
+  ]);
+}
+
+export async function getCsvTransactionExport(userId: string) {
+  const data = await getUserDataExport(userId);
+  const tagNameById = new Map(data.tags.map((tag) => [tag.id, tag.name] as const));
+  const rows = data.transactions.map((transaction) => ({
+    ...transaction,
+    tags: data.transactionTags.filter((relation) => relation.transactionId === transaction.id).map((relation) => tagNameById.get(relation.tagId)).filter((name): name is string => !!name),
+    splits: data.transactionSplits.filter((split) => split.transactionId === transaction.id),
+  }));
+  return transactionsCsv(rows, data.accounts, data.profile?.currency ?? "INR");
+}
+
+/** CSV of the transactions matching the dashboard filters. */
+export async function getFilteredCsvExport(userId: string, filters: { q?: string; type?: string; category?: string; from?: string; to?: string }) {
+  const [rows, accountRows, [profile]] = await Promise.all([
+    listTransactions(userId, { ...filters, limit: 50000 }),
+    db.select({ id: accounts.id, name: accounts.name }).from(accounts).where(eq(accounts.userId, userId)),
+    db.select({ currency: users.currency }).from(users).where(eq(users.id, userId)),
+  ]);
+  return transactionsCsv(rows.map((row) => ({ tags: [], splits: [], ...row })), accountRows, profile?.currency ?? "INR");
 }

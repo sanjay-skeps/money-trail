@@ -114,6 +114,16 @@ export const recurring = pgTable("recurring", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+// Statement imports categorize rows whose description or merchant contains `pattern`.
+export const categoryRules = pgTable("category_rules", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  pattern: varchar("pattern", { length: 100 }).notNull(),
+  type: varchar("type", { length: 12 }).notNull().default("expense"),
+  category: varchar("category", { length: 60 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({ ownerPattern: uniqueIndex("category_rules_user_pattern_type_idx").on(t.userId, sql`lower(${t.pattern})`, t.type) }));
+
 export const recurringOccurrences = pgTable("recurring_occurrences", {
   id: uuid("id").defaultRandom().primaryKey(),
   recurringId: uuid("recurring_id").notNull().references(() => recurring.id, { onDelete: "cascade" }),
