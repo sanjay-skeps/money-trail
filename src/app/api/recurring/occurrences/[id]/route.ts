@@ -1,10 +1,11 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getCurrentUserWithRefresh } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { categories, recurring, recurringOccurrences, transactions } from "@/lib/db/schema";
 import { isSameOriginRequest } from "@/lib/server/http";
+import { nextDueDate, type Cadence } from "@/lib/finance";
 import { evaluateBudgetAlerts, evaluateSmartAlerts } from "@/lib/server/ledger-service";
 export const runtime = "nodejs";
 type Context = { params: Promise<{ id: string }> };
@@ -20,16 +21,13 @@ export async function POST(request: NextRequest, { params }: Context) {
     if (!claimed) return null;
     let transactionId: string | null = null;
     if (action === "confirm") {
-      const [category] = await tx.select({ id: categories.id }).from(categories).where(and(eq(categories.userId, user.id), eq(categories.name, row.schedule.category), eq(categories.type, row.schedule.type))).limit(1);
+      const [category] = await tx.select({ id: categories.id }).from(categories).where(and(eq(categories.userId, user.id), eq(categories.name, row.schedule.category), eq(categories.type, row.schedule.type))).orderBy(sql`${categories.parentId} is not null`, categories.createdAt, categories.id).limit(1);
       const [item] = await tx.insert(transactions).values({ userId: user.id, type: row.schedule.type, description: row.schedule.description, categoryId: category?.id ?? null, category: row.schedule.category, amount: row.schedule.amount, transactionDate: row.occurrence.dueDate, paymentMethod: "bank", accountId: row.schedule.accountId }).returning({ id: transactions.id });
       transactionId = item.id;
     }
     const [updated] = await tx.update(recurringOccurrences).set({ transactionId }).where(eq(recurringOccurrences.id, row.occurrence.id)).returning();
-    const due = new Date(`${row.occurrence.dueDate}T12:00:00Z`);
-    if (row.schedule.cadence === "weekly") due.setUTCDate(due.getUTCDate() + 7);
-    if (row.schedule.cadence === "monthly") due.setUTCMonth(due.getUTCMonth() + 1);
-    if (row.schedule.cadence === "yearly") due.setUTCFullYear(due.getUTCFullYear() + 1);
-    await tx.update(recurring).set({ nextDate: due.toISOString().slice(0, 10) }).where(eq(recurring.id, row.schedule.id));
+    const nextDate = nextDueDate(row.occurrence.dueDate, row.schedule.cadence as Cadence, row.schedule.anchorDay);
+    await tx.update(recurring).set({ nextDate }).where(eq(recurring.id, row.schedule.id));
     return updated;
   });
   if (!result) return NextResponse.json({ error: "already-reviewed" }, { status: 409 });

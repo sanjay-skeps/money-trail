@@ -13,14 +13,14 @@ export const expenseInput = z.object({
   spentOn: z.iso.date(),
 });
 export async function addExpense(userId: string, input: z.infer<typeof expenseInput>) {
-  const result = await saveTransaction(userId, { ...input, type: "expense", transactionDate: input.spentOn, paymentMethod: "cash", accountId: null, toAccountId: null, merchant: null, notes: null, tags: [], splits: undefined });
+  const result = await saveTransaction(userId, { ...input, type: "expense", transactionDate: input.spentOn, paymentMethod: "cash", accountId: null, toAccountId: null, merchant: null, notes: null, tags: undefined, splits: undefined });
   if ("error" in result) throw new Error(result.error);
   return { ...result.transaction, spentOn: result.transaction.transactionDate };
 }
 export async function editExpense(userId: string, expenseId: string, input: z.infer<typeof expenseInput>) {
   const [existing] = await db.select().from(transactions).where(and(eq(transactions.id, expenseId), eq(transactions.userId, userId)));
   if (!existing) return null;
-  const result = await saveTransaction(userId, { ...input, type: "expense", transactionDate: input.spentOn, paymentMethod: existing.paymentMethod as "cash" | "upi" | "card" | "bank" | "wallet", accountId: existing.accountId, toAccountId: null, merchant: existing.merchant, notes: existing.notes, tags: [], splits: undefined }, expenseId);
+  const result = await saveTransaction(userId, { ...input, type: "expense", transactionDate: input.spentOn, paymentMethod: existing.paymentMethod as "cash" | "upi" | "card" | "bank" | "wallet", accountId: existing.accountId, toAccountId: null, merchant: existing.merchant, notes: existing.notes, tags: undefined, splits: undefined }, expenseId);
   if ("error" in result) return null;
   return { ...result.transaction, spentOn: result.transaction.transactionDate };
 }

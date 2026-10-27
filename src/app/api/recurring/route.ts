@@ -20,6 +20,6 @@ export async function POST(request: NextRequest) {
   const user = await getCurrentUserWithRefresh(); if (!user) return NextResponse.json({ error: "session" }, { status: 401 });
   const input = schema.safeParse(await readJson(request)); if (!input.success) return NextResponse.json({ error: "recurring" }, { status: 400 });
   if (input.data.accountId) { const [account] = await db.select({ id: accounts.id }).from(accounts).where(and(eq(accounts.id, input.data.accountId), eq(accounts.userId, user.id))); if (!account) return NextResponse.json({ error: "account" }, { status: 400 }); }
-  const [schedule] = await db.insert(recurring).values({ ...input.data, userId: user.id, amount: input.data.amount.toFixed(2), accountId: input.data.accountId ?? null }).returning();
+  const [schedule] = await db.insert(recurring).values({ ...input.data, userId: user.id, amount: input.data.amount.toFixed(2), accountId: input.data.accountId ?? null, anchorDay: Number(input.data.nextDate.slice(8, 10)) }).returning();
   return NextResponse.json({ recurring: schedule }, { status: 201 });
 }

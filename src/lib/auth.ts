@@ -11,6 +11,7 @@ const accessCookieName = "money-trail-access";
 const refreshCookieName = "money-trail-refresh";
 const accessLifetimeSeconds = 15 * 60;
 const refreshLifetimeSeconds = 30 * 24 * 60 * 60;
+const refreshReuseGraceMs = 30 * 1000;
 const issuer = "money-trail";
 const audience = "money-trail-web";
 const masterSecret = process.env.SESSION_SECRET ?? "";
@@ -121,29 +122,13 @@ export async function rotateRefreshToken(token: string): Promise<TokenPair | nul
 
   if (!session) return null;
   const now = new Date();
-  if (session.revokedAt) {
-    await db.update(refreshSessions).set({ revokedAt: now }).where(and(
-      eq(refreshSessions.familyId, session.familyId),
-      isNull(refreshSessions.revokedAt),
-    ));
-    return null;
-  }
   if (session.expiresAt <= now) {
     await db.update(refreshSessions).set({ revokedAt: now }).where(and(eq(refreshSessions.id, session.id), isNull(refreshSessions.revokedAt)));
     return null;
   }
+  if (session.revokedAt) return reuseOrRevoke(session, now);
 
-  const refreshId = randomUUID();
-  const expiresAt = new Date(Date.now() + refreshLifetimeSeconds * 1000);
-  const pair: TokenPair = {
-    accessToken: await signAccessToken(session.userId, session.familyId),
-    refreshToken: await signRefreshToken(session.userId, refreshId, session.familyId),
-    refreshId,
-    familyId: session.familyId,
-    userId: session.userId,
-    expiresAt,
-  };
-
+  const pair = await newTokenPair(session.userId, session.familyId);
   const rotated = await db.transaction(async (tx) => {
     const [revoked] = await tx.update(refreshSessions)
       .set({ revokedAt: now })
@@ -165,13 +150,50 @@ export async function rotateRefreshToken(token: string): Promise<TokenPair | nul
   });
 
   if (!rotated) {
-    await db.update(refreshSessions).set({ revokedAt: new Date() }).where(and(
-      eq(refreshSessions.familyId, session.familyId),
-      isNull(refreshSessions.revokedAt),
-    ));
-    return null;
+    // A concurrent request rotated this token first; treat it like any other reuse.
+    const [current] = await db.select().from(refreshSessions).where(eq(refreshSessions.id, session.id)).limit(1);
+    return current?.revokedAt ? reuseOrRevoke(current, new Date()) : null;
   }
   return pair;
+}
+
+async function newTokenPair(userId: string, familyId: string): Promise<TokenPair> {
+  const refreshId = randomUUID();
+  return {
+    accessToken: await signAccessToken(userId, familyId),
+    refreshToken: await signRefreshToken(userId, refreshId, familyId),
+    refreshId,
+    familyId,
+    userId,
+    expiresAt: new Date(Date.now() + refreshLifetimeSeconds * 1000),
+  };
+}
+
+/**
+ * A refresh token presented again shortly after it was rotated is usually a benign race
+ * (parallel requests or tabs sending the old cookie), so it gets a sibling session in the
+ * same family. Later reuse, or reuse after the family was revoked (logout, password change),
+ * is treated as theft and revokes the whole family.
+ */
+async function reuseOrRevoke(session: typeof refreshSessions.$inferSelect, now: Date): Promise<TokenPair | null> {
+  const recentlyRotated = !!session.revokedAt && now.getTime() - session.revokedAt.getTime() < refreshReuseGraceMs;
+  if (recentlyRotated) {
+    const [active] = await db.select({ id: refreshSessions.id }).from(refreshSessions).where(and(
+      eq(refreshSessions.familyId, session.familyId),
+      isNull(refreshSessions.revokedAt),
+      gt(refreshSessions.expiresAt, now),
+    )).limit(1);
+    if (active) {
+      const pair = await newTokenPair(session.userId, session.familyId);
+      await db.insert(refreshSessions).values({ id: pair.refreshId, familyId: pair.familyId, userId: pair.userId, expiresAt: pair.expiresAt });
+      return pair;
+    }
+  }
+  await db.update(refreshSessions).set({ revokedAt: now }).where(and(
+    eq(refreshSessions.familyId, session.familyId),
+    isNull(refreshSessions.revokedAt),
+  ));
+  return null;
 }
 
 export async function destroySession() {

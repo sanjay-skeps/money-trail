@@ -146,7 +146,7 @@ export function DashboardShell() {
     }
     if (!response.ok) {
       setNoticeError(true);
-      setNotice(result.error === "expense" ? "Check the expense details and try again." : "That change could not be saved. Please try again.");
+      setNotice(result.error === "expense" ? "Check the expense details and try again." : result.error === "split" ? "Split shares must add up to the transaction amount." : result.error === "exists" ? "A category with that name already exists." : "That change could not be saved. Please try again.");
       return false;
     }
     setNoticeError(false);
@@ -184,7 +184,7 @@ export function DashboardShell() {
     const form = event.currentTarget;
     setPending(true);
     const raw = Object.fromEntries([...new FormData(form).entries()].filter(([key]) => key !== "id"));
-    const values = { ...raw, transactionDate: raw.spentOn, spentOn: undefined, accountId: raw.accountId || null, toAccountId: raw.toAccountId || null, tags: String(raw.tags ?? "").split(",").map((tag) => tag.trim()).filter(Boolean), splits: parseSplits(raw.splitDetails) };
+    const values = { ...raw, transactionDate: raw.spentOn, spentOn: undefined, accountId: raw.accountId || null, toAccountId: raw.toAccountId || null, tags: String(raw.tags ?? "").split(",").map((tag) => tag.trim()).filter(Boolean), splits: parseSplits(raw.splitDetails) ?? [] };
     try {
       await handleMutation(await fetch(`/api/transactions/${encodeURIComponent(expenseId)}`, {
         method: "PATCH",

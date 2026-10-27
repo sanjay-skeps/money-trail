@@ -1,6 +1,7 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable, text, timestamp, uuid, varchar, numeric, date, index, boolean,
-  integer, uniqueIndex,
+  integer, smallint, uniqueIndex,
 } from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
@@ -32,7 +33,7 @@ export const categories = pgTable("categories", {
   icon: varchar("icon", { length: 16 }),
   isDefault: boolean("is_default").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => ({ ownerName: uniqueIndex("categories_user_name_parent_idx").on(t.userId, t.name, t.parentId) }));
+}, (t) => ({ ownerName: uniqueIndex("categories_user_name_parent_idx").on(t.userId, t.name, sql`coalesce(${t.parentId}, '00000000-0000-0000-0000-000000000000'::uuid)`) }));
 
 export const transactions = pgTable("transactions", {
   id: uuid("id").defaultRandom().primaryKey(),
@@ -106,6 +107,8 @@ export const recurring = pgTable("recurring", {
   amount: numeric("amount", { precision: 14, scale: 2 }).notNull(),
   cadence: varchar("cadence", { length: 12 }).notNull(),
   nextDate: date("next_date").notNull(),
+  // Day of month that monthly/yearly schedules return to after short months clamp it.
+  anchorDay: smallint("anchor_day"),
   accountId: uuid("account_id").references(() => accounts.id, { onDelete: "set null" }),
   active: boolean("active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

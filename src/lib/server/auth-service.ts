@@ -5,6 +5,7 @@ import { z } from "zod";
 import { createSession, destroySession } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { accounts, categories, users } from "@/lib/db/schema";
+import { isUniqueViolation } from "@/lib/server/http";
 
 export const signupInput = z.object({
   name: z.string().trim().min(2).max(120),
@@ -31,7 +32,7 @@ export async function createAccount(input: z.infer<typeof signupInput>) {
     await createSession(user.id);
     return { ok: true as const, user };
   } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
+    if (isUniqueViolation(error)) {
       return { ok: false as const, reason: "exists" as const };
     }
     throw error;

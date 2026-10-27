@@ -13,6 +13,13 @@ export function isSameOriginRequest(request: NextRequest) {
   return !fetchSite || fetchSite === "same-origin" || fetchSite === "none";
 }
 
+// Drizzle wraps driver errors in DrizzleQueryError, so the Postgres code may sit on `cause`.
+export function isUniqueViolation(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  if ("code" in error && error.code === "23505") return true;
+  return "cause" in error && isUniqueViolation(error.cause);
+}
+
 export async function readJson(request: NextRequest): Promise<unknown> {
   try {
     return await request.json();
